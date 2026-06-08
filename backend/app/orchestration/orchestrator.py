@@ -1,0 +1,814 @@
+"""
+app/orchestration/orchestrator.py
+──────────────────────────────────
+ResearchOrchestrator — coordinates all Phase 3 + Phase 4 agents sequentially.
+
+Phase 3 execution order (preserved, not changed):
+    User Query
+    → PLANNING:    PlannerAgent.plan()
+    → RESEARCHING: ResearchAgent.research() × N tasks (sequential, no gather)
+    → CRITIQUING:  CriticAgent.critique()
+    → REPORTING:   ReportWriterAgent.write()
+    → COMPLETED
+
+Phase 4 extension: Evaluation loop around Phase 3 pipeline.
+    PLANNING (once only)
+    loop (max max_research_iterations times):
+        RESEARCHING
+        CRITIQUING  (skip for low_complexity on iteration 1 only)
+        REPORTING
+        EVALUATING  ← NEW
+        if sufficient or max_iterations reached: break
+        else: continue with gap_tasks only
+    COMPLETED
+
+Design principles:
+  - One LLM call at a time: all agent calls route through LLMExecutionManager.
+  - No asyncio.gather, no parallel execution, no background tasks.
+  - State persisted to SQLite at every stage transition.
+  - Structured logging at every transition with session_id and duration.
+  - Failure handling per spec:
+      PlannerAgent fails      → session=failed, stop, return
+      ResearchAgent fails     → degraded result stored, continue
+      CriticAgent fails       → fallback CriticResult, continue
+      ReportWriterAgent fails → session=failed, stop, return
+      EvaluatorAgent fails    → fail-safe result, treat as sufficient=True
+
+Note: _create_state() is the factory for WorkflowState (replacing the
+eliminated workflow.py thin-file). State management lives here — not in
+a separate file — because it has no independent utility.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from datetime import datetime, timezone
+
+from app.agents.critic_agent import CriticAgent
+from app.agents.evaluator_agent import EvaluatorAgent
+from app.agents.planner_agent import PlannerAgent
+from app.agents.report_writer_agent import ReportWriterAgent
+from app.agents.research_agent import ResearchAgent
+from app.core.config import Settings
+from app.core.exceptions import PlannerException, ReportWriterException
+from app.db.research_repository import ResearchRepository
+from app.llm.execution_manager import LLMExecutionManager
+from app.memory.memory_service import MemoryService
+from app.schemas.research import (
+    CriticResult,
+    EvaluationResult,
+    WorkflowStage,
+    WorkflowState,
+)
+from app.core.telemetry import get_tracer
+
+logger = logging.getLogger(__name__)
+tracer = get_tracer(__name__)
+
+
+class ResearchOrchestrator:
+    """
+    Sequential orchestrator for the Phase 3 + Phase 4 multi-agent research pipeline.
+
+    All agents are injected as singletons (from app.state) so they share
+    the same BaseLLMProvider and LLMExecutionManager throughout the session.
+
+    Constructor Args:
+        planner:             PlannerAgent singleton.
+        researcher:          ResearchAgent singleton.
+        critic:              CriticAgent singleton.
+        report_writer:       ReportWriterAgent singleton.
+        memory_service:      MemoryService singleton (shared from Phase 2).
+        research_repository: ResearchRepository for session persistence.
+        execution_manager:   LLMExecutionManager (single global LLM lock).
+        skip_critic_for_low_complexity: Skip critiquing for low-complexity plans.
+        evaluator:           EvaluatorAgent singleton (Phase 4).
+        settings:            Settings instance for Phase 4 config (Phase 4).
+    """
+
+    def __init__(
+        self,
+        planner: PlannerAgent,
+        researcher: ResearchAgent,
+        critic: CriticAgent,
+        report_writer: ReportWriterAgent,
+        memory_service: MemoryService,
+        research_repository: ResearchRepository,
+        execution_manager: LLMExecutionManager,
+        skip_critic_for_low_complexity: bool = True,
+        evaluator: EvaluatorAgent | None = None,
+        settings: Settings | None = None,
+    ) -> None:
+        self._planner = planner
+        self._researcher = researcher
+        self._critic = critic
+        self._report_writer = report_writer
+        self._memory = memory_service
+        self._repo = research_repository
+        self._manager = execution_manager
+        self._skip_critic_for_low_complexity = skip_critic_for_low_complexity
+        self._evaluator = evaluator
+        self._settings = settings
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    async def run(self, query: str, session_id: str) -> WorkflowState:
+        """
+        Execute the full research pipeline for a query.
+
+        Phase 4: wraps the Phase 3 pipeline in an evaluation loop.
+        PLANNING runs once. RESEARCHING/CRITIQUING/REPORTING/EVALUATING
+        repeat until confidence is sufficient or max_iterations is reached.
+
+        Args:
+            query:      The user's research query.
+            session_id: Unique session ID (pre-generated by the route handler).
+
+        Returns:
+            The final WorkflowState (status = "completed" or "failed").
+        """
+        with tracer.start_as_current_span("research.session") as span:
+            span.set_attribute("session_id", session_id)
+            span.set_attribute("query", query[:200])
+
+            session_start = time.monotonic()
+            state = self._create_state(session_id, query)
+
+        # Persist initial state
+        await self._repo.create(state)
+
+        logger.info(
+            "research_session_created",
+            extra={"session_id": session_id, "query": query[:100]},
+        )
+
+        # ── Stage 1: PLANNING — runs ONCE, never repeated ─────────────────────
+        state = await self._run_planning(state)
+        if state.status == "failed":
+            return state
+
+        # Determine if Phase 4 evaluation loop is active
+        evaluator_active = (
+            self._evaluator is not None
+            and self._settings is not None
+            and self._settings.evaluator_enabled
+        )
+        max_iterations = (
+            self._settings.max_research_iterations
+            if self._settings is not None
+            else 1
+        )
+
+        # Keep the original plan tasks for reference across iterations
+        original_tasks = list(state.plan.tasks)  # type: ignore[union-attr]
+
+        # ── Evaluation loop ───────────────────────────────────────────────────
+        for iteration in range(1, max_iterations + 1):
+
+            # Track current iteration on state
+            state = state.model_copy(update={"iteration": iteration})
+
+            # ── RESEARCHING ───────────────────────────────────────────────────
+            # Iteration 1: research original plan tasks.
+            # Iteration 2+: research only gap_tasks from last evaluation.
+            if iteration == 1:
+                tasks_this_iteration = original_tasks
+            else:
+                last_eval = state.evaluations[-1]
+                tasks_this_iteration = last_eval.gap_tasks
+                if not tasks_this_iteration:
+                    # No gaps identified — nothing to research
+                    logger.info(
+                        "no_gap_tasks_stopping_loop",
+                        extra={
+                            "session_id": session_id,
+                            "iteration": iteration,
+                        },
+                    )
+                    break
+
+            # Temporarily narrow plan.tasks to this iteration's tasks so that
+            # _run_researching processes only the right tasks. Previous results
+            # remain in state.results — they are never discarded.
+            iter_plan = state.plan.model_copy(  # type: ignore[union-attr]
+                update={"tasks": tasks_this_iteration}
+            )
+            state = state.model_copy(update={"plan": iter_plan})
+            state = await self._run_researching(state)
+
+            # ── CRITIQUING ────────────────────────────────────────────────────
+            # Skip for low_complexity on iteration 1 only (existing Phase 3 logic).
+            # From iteration 2 onwards, CRITIQUING always runs.
+            skip_critic = (
+                iteration == 1
+                and self._skip_critic_for_low_complexity
+                and state.plan is not None
+                and state.plan.estimated_complexity == "low"
+            )
+            if skip_critic:
+                logger.info(
+                    "stage_skipped",
+                    extra={
+                        "stage": WorkflowStage.CRITIQUING.value,
+                        "reason": "low_complexity_plan",
+                        "session_id": state.session_id,
+                        "iteration": iteration,
+                    },
+                )
+                auto_critic = CriticResult(
+                    approved=True,
+                    issues=[],
+                    suggestions=[],
+                    overall_quality="acceptable",
+                    reviewed_task_ids=[r.task_id for r in state.results],
+                )
+                state = state.model_copy(
+                    update={
+                        "critic_result": auto_critic,
+                        "current_stage": WorkflowStage.REPORTING,
+                    }
+                )
+                await self._repo.update(state)
+            else:
+                state = await self._run_critiquing(state)
+                # CriticAgent never fails the session — always continues
+
+            # ── REPORTING ─────────────────────────────────────────────────────
+            state = await self._run_reporting(state)
+            if state.status == "failed":
+                return state
+
+            # ── EVALUATING ────────────────────────────────────────────────────
+            if not evaluator_active:
+                # evaluator_enabled=False — behave exactly like Phase 3
+                break
+
+            assert self._evaluator is not None  # guaranteed by evaluator_active check
+            assert self._settings is not None
+
+            eval_result = await self._run_evaluating(state, iteration)
+            state = state.model_copy(
+                update={
+                    "evaluations": [*state.evaluations, eval_result],
+                }
+            )
+            await self._repo.update(state)
+
+            if eval_result.sufficient:
+                logger.info(
+                    "evaluation_sufficient",
+                    extra={
+                        "session_id": session_id,
+                        "iteration": iteration,
+                        "confidence_score": round(eval_result.confidence_score, 3),
+                        "threshold": self._settings.confidence_threshold,
+                    },
+                )
+                break
+
+            if iteration < max_iterations:
+                logger.info(
+                    "evaluation_insufficient_continuing",
+                    extra={
+                        "session_id": session_id,
+                        "iteration": iteration,
+                        "confidence_score": round(eval_result.confidence_score, 3),
+                        "threshold": self._settings.confidence_threshold,
+                        "gap_count": len(eval_result.gaps),
+                        "next_iteration": iteration + 1,
+                    },
+                )
+                # Restore full plan (original + all gap tasks discovered so far)
+                # so _run_planning reference stays intact if ever inspected.
+                all_gap_tasks = [
+                    t for e in state.evaluations for t in e.gap_tasks
+                ]
+                full_plan = state.plan.model_copy(  # type: ignore[union-attr]
+                    update={"tasks": original_tasks + all_gap_tasks}
+                )
+                state = state.model_copy(update={"plan": full_plan})
+            else:
+                logger.info(
+                    "max_iterations_reached",
+                    extra={
+                        "session_id": session_id,
+                        "iteration": iteration,
+                        "confidence_score": round(eval_result.confidence_score, 3),
+                        "threshold": self._settings.confidence_threshold,
+                    },
+                )
+
+        # ── Stage 5: COMPLETED ────────────────────────────────────────────────
+        state = state.model_copy(
+            update={
+                "status": "completed",
+                "current_stage": WorkflowStage.COMPLETED,
+                "completed_at": datetime.now(timezone.utc),
+            }
+        )
+        await self._repo.update(state)
+
+        total_duration = time.monotonic() - session_start
+        logger.info(
+            "session_completed",
+            extra={
+                "session_id": session_id,
+                "total_duration_seconds": round(total_duration, 3),
+                "quality": (
+                    state.critic_result.overall_quality
+                    if state.critic_result
+                    else "unknown"
+                ),
+                "total_iterations": state.iteration,
+            },
+        )
+
+        return state
+
+    # ── Private stage runners ─────────────────────────────────────────────────
+
+    async def _run_planning(self, state: WorkflowState) -> WorkflowState:
+        """Execute the PLANNING stage."""
+        session_id = state.session_id
+        
+        with tracer.start_as_current_span("research.planning") as span:
+            span.set_attribute("session_id", session_id)
+            
+            stage_start = time.monotonic()
+
+        logger.info(
+            "agent_started",
+            extra={
+                "agent": "planner_agent",
+                "stage": WorkflowStage.PLANNING.value,
+                "session_id": session_id,
+            },
+        )
+
+        agent_started_at = datetime.now(timezone.utc)
+        try:
+            plan = await self._planner.plan(
+                query=state.query,
+                session_id=session_id,
+            )
+        except PlannerException as exc:
+            duration = time.monotonic() - stage_start
+            logger.error(
+                "agent_failed",
+                extra={
+                    "agent": "planner_agent",
+                    "stage": WorkflowStage.PLANNING.value,
+                    "session_id": session_id,
+                    "error": str(exc),
+                },
+            )
+            failed_state = state.model_copy(
+                update={
+                    "status": "failed",
+                    "current_stage": WorkflowStage.FAILED,
+                    "error": str(exc),
+                    "completed_at": datetime.now(timezone.utc),
+                }
+            )
+            await self._repo.update(failed_state)
+
+            logger.error(
+                "session_failed",
+                extra={
+                    "session_id": session_id,
+                    "stage": WorkflowStage.PLANNING.value,
+                    "error": str(exc),
+                },
+            )
+
+            await self._record_metric(
+                session_id=session_id,
+                agent_name="planner_agent",
+                stage=WorkflowStage.PLANNING.value,
+                started_at=agent_started_at,
+                duration=duration,
+                model_used=None,
+            )
+            return failed_state
+
+        duration = time.monotonic() - stage_start
+        logger.info(
+            "agent_completed",
+            extra={
+                "agent": "planner_agent",
+                "stage": WorkflowStage.PLANNING.value,
+                "session_id": session_id,
+                "duration_seconds": round(duration, 3),
+            },
+        )
+
+        new_state = state.model_copy(
+            update={
+                "plan": plan,
+                "current_stage": WorkflowStage.RESEARCHING,
+            }
+        )
+
+        logger.info(
+            "stage_transition",
+            extra={
+                "from_stage": WorkflowStage.PLANNING.value,
+                "to_stage": WorkflowStage.RESEARCHING.value,
+                "session_id": session_id,
+            },
+        )
+
+        await self._repo.update(new_state)
+        await self._record_metric(
+            session_id=session_id,
+            agent_name="planner_agent",
+            stage=WorkflowStage.PLANNING.value,
+            started_at=agent_started_at,
+            duration=duration,
+            model_used=None,
+        )
+
+        return new_state
+
+    async def _run_researching(self, state: WorkflowState) -> WorkflowState:
+        """Execute the RESEARCHING stage — one task at a time, sequentially."""
+        session_id = state.session_id
+        assert state.plan is not None  # guaranteed by _run_planning
+
+        results = list(state.results)  # mutable copy — accumulates across iterations
+
+        with tracer.start_as_current_span("research.researching") as span:
+            span.set_attribute("session_id", session_id)
+            span.set_attribute("task_count", len(state.plan.tasks))
+            
+            for task in state.plan.tasks:
+                stage_start = time.monotonic()
+                agent_started_at = datetime.now(timezone.utc)
+
+                logger.info(
+                    "agent_started",
+                    extra={
+                        "agent": "research_agent",
+                        "stage": WorkflowStage.RESEARCHING.value,
+                        "session_id": session_id,
+                        "task_id": task.task_id,
+                    },
+                )
+
+                # ResearchAgent.research() never raises — returns degraded result
+                result = await self._researcher.research(
+                    task=task,
+                    memory_service=self._memory,
+                    session_id=session_id,
+                )
+                results.append(result)
+
+                duration = time.monotonic() - stage_start
+                logger.info(
+                    "agent_completed",
+                    extra={
+                        "agent": "research_agent",
+                        "stage": WorkflowStage.RESEARCHING.value,
+                        "session_id": session_id,
+                        "task_id": task.task_id,
+                        "duration_seconds": round(duration, 3),
+                    },
+                )
+
+                await self._record_metric(
+                    session_id=session_id,
+                    agent_name="research_agent",
+                    stage=WorkflowStage.RESEARCHING.value,
+                    started_at=agent_started_at,
+                    duration=duration,
+                    model_used=None,
+                )
+
+        new_state = state.model_copy(
+            update={
+                "results": results,
+                "current_stage": WorkflowStage.CRITIQUING,
+            }
+        )
+
+        logger.info(
+            "stage_transition",
+            extra={
+                "from_stage": WorkflowStage.RESEARCHING.value,
+                "to_stage": WorkflowStage.CRITIQUING.value,
+                "session_id": session_id,
+            },
+        )
+
+        await self._repo.update(new_state)
+        return new_state
+
+    async def _run_critiquing(self, state: WorkflowState) -> WorkflowState:
+        """Execute the CRITIQUING stage."""
+        session_id = state.session_id
+        
+        with tracer.start_as_current_span("research.critiquing") as span:
+            span.set_attribute("session_id", session_id)
+
+            stage_start = time.monotonic()
+            agent_started_at = datetime.now(timezone.utc)
+
+        logger.info(
+            "agent_started",
+            extra={
+                "agent": "critic_agent",
+                "stage": WorkflowStage.CRITIQUING.value,
+                "session_id": session_id,
+            },
+        )
+
+        # CriticAgent.critique() never raises — returns fallback on failure
+        critic_result = await self._critic.critique(
+            results=state.results,
+            original_query=state.query,
+            session_id=session_id,
+        )
+
+        duration = time.monotonic() - stage_start
+        logger.info(
+            "agent_completed",
+            extra={
+                "agent": "critic_agent",
+                "stage": WorkflowStage.CRITIQUING.value,
+                "session_id": session_id,
+                "duration_seconds": round(duration, 3),
+            },
+        )
+
+        new_state = state.model_copy(
+            update={
+                "critic_result": critic_result,
+                "current_stage": WorkflowStage.REPORTING,
+            }
+        )
+
+        logger.info(
+            "stage_transition",
+            extra={
+                "from_stage": WorkflowStage.CRITIQUING.value,
+                "to_stage": WorkflowStage.REPORTING.value,
+                "session_id": session_id,
+            },
+        )
+
+        await self._repo.update(new_state)
+        await self._record_metric(
+            session_id=session_id,
+            agent_name="critic_agent",
+            stage=WorkflowStage.CRITIQUING.value,
+            started_at=agent_started_at,
+            duration=duration,
+            model_used=None,
+        )
+
+        return new_state
+
+    async def _run_reporting(self, state: WorkflowState) -> WorkflowState:
+        """Execute the REPORTING stage."""
+        session_id = state.session_id
+        
+        with tracer.start_as_current_span("research.reporting") as span:
+            span.set_attribute("session_id", session_id)
+
+            stage_start = time.monotonic()
+            agent_started_at = datetime.now(timezone.utc)
+
+            assert state.plan is not None
+            assert state.critic_result is not None
+
+        logger.info(
+            "agent_started",
+            extra={
+                "agent": "report_writer_agent",
+                "stage": WorkflowStage.REPORTING.value,
+                "session_id": session_id,
+            },
+        )
+
+        try:
+            report = await self._report_writer.write(
+                plan=state.plan,
+                results=state.results,
+                critic=state.critic_result,
+                original_query=state.query,
+                session_id=session_id,
+            )
+        except ReportWriterException as exc:
+            duration = time.monotonic() - stage_start
+            logger.error(
+                "agent_failed",
+                extra={
+                    "agent": "report_writer_agent",
+                    "stage": WorkflowStage.REPORTING.value,
+                    "session_id": session_id,
+                    "error": str(exc),
+                },
+            )
+            failed_state = state.model_copy(
+                update={
+                    "status": "failed",
+                    "current_stage": WorkflowStage.FAILED,
+                    "error": str(exc),
+                    "completed_at": datetime.now(timezone.utc),
+                }
+            )
+            await self._repo.update(failed_state)
+
+            logger.error(
+                "session_failed",
+                extra={
+                    "session_id": session_id,
+                    "stage": WorkflowStage.REPORTING.value,
+                    "error": str(exc),
+                },
+            )
+
+            await self._record_metric(
+                session_id=session_id,
+                agent_name="report_writer_agent",
+                stage=WorkflowStage.REPORTING.value,
+                started_at=agent_started_at,
+                duration=duration,
+                model_used=None,
+            )
+            return failed_state
+
+        duration = time.monotonic() - stage_start
+        logger.info(
+            "agent_completed",
+            extra={
+                "agent": "report_writer_agent",
+                "stage": WorkflowStage.REPORTING.value,
+                "session_id": session_id,
+                "duration_seconds": round(duration, 3),
+            },
+        )
+
+        new_state = state.model_copy(
+            update={
+                "report": report,
+                "current_stage": WorkflowStage.COMPLETED,
+            }
+        )
+
+        logger.info(
+            "stage_transition",
+            extra={
+                "from_stage": WorkflowStage.REPORTING.value,
+                "to_stage": WorkflowStage.COMPLETED.value,
+                "session_id": session_id,
+            },
+        )
+
+        await self._repo.update(new_state)
+        await self._record_metric(
+            session_id=session_id,
+            agent_name="report_writer_agent",
+            stage=WorkflowStage.REPORTING.value,
+            started_at=agent_started_at,
+            duration=duration,
+            model_used=None,
+        )
+
+        return new_state
+
+    async def _run_evaluating(
+        self,
+        state: WorkflowState,
+        iteration: int,
+    ) -> EvaluationResult:
+        """
+        Execute the EVALUATING stage.
+
+        Calls EvaluatorAgent.evaluate() and records metrics.
+        Never raises — EvaluatorAgent guarantees fail-safe returns.
+
+        Args:
+            state:     Current WorkflowState (must have report set).
+            iteration: Current loop iteration (1-based).
+
+        Returns:
+            EvaluationResult (always — never raises).
+        """
+        session_id = state.session_id
+        
+        with tracer.start_as_current_span("research.evaluating") as span:
+            span.set_attribute("session_id", session_id)
+            span.set_attribute("iteration", iteration)
+
+            stage_start = time.monotonic()
+            agent_started_at = datetime.now(timezone.utc)
+
+        logger.info(
+            "agent_started",
+            extra={
+                "agent": "evaluator_agent",
+                "stage": WorkflowStage.EVALUATING.value,
+                "session_id": session_id,
+                "iteration": iteration,
+            },
+        )
+
+        assert state.report is not None  # guaranteed: called after _run_reporting
+        assert self._evaluator is not None
+        assert self._settings is not None
+
+        eval_result = await self._evaluator.evaluate(
+            query=state.query,
+            results=state.results,
+            report=state.report,
+            iteration=iteration,
+            confidence_threshold=self._settings.confidence_threshold,
+            session_id=session_id,
+        )
+
+        duration = time.monotonic() - stage_start
+        logger.info(
+            "agent_completed",
+            extra={
+                "agent": "evaluator_agent",
+                "stage": WorkflowStage.EVALUATING.value,
+                "session_id": session_id,
+                "iteration": iteration,
+                "sufficient": eval_result.sufficient,
+                "confidence_score": round(eval_result.confidence_score, 3),
+                "duration_seconds": round(duration, 3),
+            },
+        )
+
+        await self._record_metric(
+            session_id=session_id,
+            agent_name="evaluator_agent",
+            stage=WorkflowStage.EVALUATING.value,
+            started_at=agent_started_at,
+            duration=duration,
+            model_used=None,
+        )
+
+        return eval_result
+
+    # ── Private helpers ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _create_state(session_id: str, query: str) -> WorkflowState:
+        """
+        Create the initial WorkflowState for a new session.
+
+        This replaces the eliminated workflow.py factory. State creation
+        is a one-liner with no I/O — it lives here for cohesion.
+        """
+        now = datetime.now(timezone.utc)
+        return WorkflowState(
+            session_id=session_id,
+            query=query,
+            status="running",
+            current_stage=WorkflowStage.PLANNING,
+            plan=None,
+            results=[],
+            critic_result=None,
+            report=None,
+            error=None,
+            created_at=now,
+            updated_at=now,
+            completed_at=None,
+            iteration=1,
+            evaluations=[],
+        )
+
+    async def _record_metric(
+        self,
+        *,
+        session_id: str,
+        agent_name: str,
+        stage: str,
+        started_at: datetime,
+        duration: float,
+        model_used: str | None,
+    ) -> None:
+        """Record an agent execution metric (best-effort, never raises)."""
+        try:
+            completed_at = datetime.now(timezone.utc)
+            await self._repo.record_agent_metric(
+                session_id=session_id,
+                agent_name=agent_name,
+                stage=stage,
+                execution_time=duration,
+                model_used=model_used,
+                started_at=started_at,
+                completed_at=completed_at,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to record agent metric",
+                extra={
+                    "session_id": session_id,
+                    "agent_name": agent_name,
+                    "error": str(exc),
+                },
+            )
