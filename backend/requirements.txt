@@ -1,0 +1,40 @@
+# ── Web framework ──────────────────────────────────────────────────────────────
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+
+# ── HTTP client (async Ollama calls) ──────────────────────────────────────────
+httpx==0.28.1
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+pydantic==2.10.3
+pydantic-settings==2.6.1
+
+# ── Retry logic ───────────────────────────────────────────────────────────────
+tenacity==9.0.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv==1.0.1
+python-multipart==0.0.20
+
+# ── Phase 2: Document parsing ─────────────────────────────────────────────────
+pypdf==4.3.0
+
+# ── Phase 2: Tokenizer (HuggingFace AutoTokenizer) ────────────────────────────
+transformers==4.46.3
+tokenizers==0.20.3
+
+# ── Phase 2: Vector store ─────────────────────────────────────────────────────
+chromadb==0.5.23
+
+# ── Phase 2: Async SQLite metadata store ──────────────────────────────────────
+aiosqlite==0.20.0
+
+# ── Phase 2: Numerical operations (cosine reranker) ───────────────────────────
+numpy>=1.26.0
+
+# ── Phase 5: Production Infrastructure ────────────────────────────────────────
+redis==5.0.8
+opentelemetry-api==1.27.0
+opentelemetry-sdk==1.27.0
+opentelemetry-instrumentation-fastapi==0.48b0
+opentelemetry-exporter-otlp-proto-http==1.27.0
