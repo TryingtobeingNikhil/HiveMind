@@ -1,0 +1,43 @@
+version: "3.8"
+
+services:
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=production
+      - LOG_FORMAT=json
+      - REDIS_URL=redis://redis:6379/0
+      - OTEL_ENABLED=true
+      - OTEL_ENDPOINT=http://jaeger:4318/v1/traces
+      - OTEL_SERVICE_NAME=open-deep-research
+      # To run properly locally, point Ollama to the host
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    volumes:
+      - data_volume:/app/data
+    depends_on:
+      - redis
+      - jaeger
+
+  redis:
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.56
+    ports:
+      - "16686:16686" # Web UI
+      - "4318:4318"   # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
+volumes:
+  data_volume:
+  redis_data:
