@@ -1,0 +1,63 @@
+services:
+
+  # ── Ollama — Local LLM server ────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: odr-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 5
+    networks:
+      - odr-network
+
+  # ── Backend — FastAPI application ────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: odr-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Override Ollama URL to use the compose service hostname
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - APP_ENV=development
+      - LOG_FORMAT=text
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    networks:
+      - odr-network
+    volumes:
+      # Mount source for live reload in development
+      - ./app:/app/app:ro
+
+# ── Named volumes ────────────────────────────────────────────────────────────
+volumes:
+  ollama_data:
+    driver: local
+
+# ── Networks ─────────────────────────────────────────────────────────────────
+networks:
+  odr-network:
+    driver: bridge
