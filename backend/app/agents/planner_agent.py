@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """\
 You are a research planning assistant. Your ONLY job is to decompose a research \
-query into a structured list of sub-tasks.
+query into the MINIMUM number of sub-tasks needed to answer it fully.
 
 STRICT RULES:
 1. Respond with VALID JSON ONLY. No markdown, no code fences, no extra text.
@@ -52,8 +52,11 @@ STRICT RULES:
        }
      ]
    }
-3. Generate between 1 and 7 tasks. Each task must be a specific, actionable \
-sub-question.
+3. Choose the task count based on query complexity — use the MINIMUM needed:
+   - Simple factual questions ("what is X", "define Y"): 1-3 tasks
+   - Moderately complex questions ("how does X work", "compare X and Y"): 3-4 tasks
+   - Complex multi-part research (multiple distinct concepts, deep comparisons): 5-7 tasks
+   Do NOT pad with redundant tasks. Do NOT generate more tasks than necessary.
 4. Priority 1 is the most important task. Assign priorities sequentially.
 5. Tasks must be ordered by priority (ascending).
 """
@@ -61,14 +64,17 @@ sub-question.
 _USER_TEMPLATE = """\
 Research query: {query}
 
-Decompose this into specific research sub-tasks. Return ONLY the JSON object.
+Decompose this into the MINIMUM number of specific research sub-tasks needed \
+to answer it fully. Return ONLY the JSON object.
 """
 
 # ── Complexity thresholds ─────────────────────────────────────────────────────
+# Widened so that "high" is genuinely rare — only deep multi-faceted research.
+# Matches the calibrated prompt above (simple = 1-3 tasks, moderate = 3-5, complex = 6-7).
 
-_COMPLEXITY_LOW = 2     # 1–2 tasks
-_COMPLEXITY_MEDIUM = 4  # 3–4 tasks
-# 5+ tasks → high
+_COMPLEXITY_LOW    = 3  # 1–3 tasks → low
+_COMPLEXITY_MEDIUM = 5  # 4–5 tasks → medium
+# 6–7 tasks → high
 
 
 def _estimate_complexity(task_count: int) -> str:
