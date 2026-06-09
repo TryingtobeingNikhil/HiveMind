@@ -11,8 +11,10 @@ Responsibilities:
   5. Extract source document_ids from RetrievedChunk metadata.
 
 Failure contract (graceful degradation):
-  - If memory_service.retrieve() raises: return a degraded ResearchResult
-    with confidence=0.0, sources=[], findings="retrieval failed". Do NOT raise.
+  - If memory_service.retrieve() raises OR returns empty: skip RAG and fall
+    through to a general-knowledge LLM call. confidence is set to
+    _GENERAL_KNOWLEDGE_CONFIDENCE (0.3) to honestly reflect no document backing.
+    This mirrors the critic-bypass pattern for low-complexity tasks.
   - If the LLM call itself fails: the exception propagates to the orchestrator,
     which stores a degraded result and continues (does not fail the session).
 
@@ -38,7 +40,8 @@ logger = logging.getLogger(__name__)
 
 _TOP_K = 5
 _SCORE_THRESHOLD = 0.3
-_DEFAULT_CONFIDENCE = 0.2   # used when no chunks are retrieved
+_DEFAULT_CONFIDENCE = 0.2        # mean retrieval score when chunks exist but score is low
+_GENERAL_KNOWLEDGE_CONFIDENCE = 0.3  # fixed score when answering from LLM knowledge (no RAG)
 
 # ── Prompt templates ──────────────────────────────────────────────────────────
 
@@ -54,6 +57,19 @@ RULES:
 5. Do NOT make up information not present in the excerpts.
 """
 
+# System prompt used when no documents are available — answers from general knowledge.
+_GENERAL_KNOWLEDGE_SYSTEM_PROMPT = """\
+You are a research analyst with broad general knowledge. Your job is to answer \
+a research sub-question accurately and directly when no documents are available.
+
+RULES:
+1. Answer directly and factually from general knowledge.
+2. Do NOT refuse or say you cannot answer — provide the best answer you can.
+3. Write in clear, concise prose. 2-4 paragraphs.
+4. End with a single sentence noting the answer is based on general knowledge,
+   not retrieved documents.
+"""
+
 _USER_TEMPLATE = """\
 Research sub-question: {query}
 
@@ -64,12 +80,12 @@ Synthesise the above excerpts into findings for the research sub-question. \
 Write 2-4 paragraphs.
 """
 
-_NO_CONTEXT_TEMPLATE = """\
+# Used when RAG is skipped (empty knowledge base or retrieval error).
+_GENERAL_KNOWLEDGE_TEMPLATE = """\
 Research sub-question: {query}
 
-No relevant documents were found in the knowledge base for this query.
-Provide a brief explanation of what information would be needed to answer \
-this question and note that the knowledge base did not contain relevant data.
+Answer this sub-question using your general knowledge. \
+Write 2-4 clear, factual paragraphs.
 """
 
 
@@ -88,7 +104,9 @@ def _compute_confidence(chunks: list[RetrievedChunk]) -> float:
     """
     Compute confidence as the mean of retrieval scores.
 
-    Returns _DEFAULT_CONFIDENCE if no chunks were retrieved.
+    Returns _DEFAULT_CONFIDENCE if chunks exist but scores are low.
+    Returns _GENERAL_KNOWLEDGE_CONFIDENCE (via caller) when chunks=[]
+    to distinguish from a real retrieval score of 0.
     Clamped to [0.0, 1.0].
     """
     if not chunks:
@@ -148,7 +166,11 @@ class ResearchAgent:
         )
 
         # ── Step 1: Retrieve relevant chunks ─────────────────────────────────
+        # If retrieval fails or returns nothing, fall through to a general-knowledge
+        # LLM call rather than short-circuiting with a useless "retrieval failed"
+        # result. This mirrors the critic-bypass for low-complexity tasks.
         chunks: list[RetrievedChunk] = []
+        retrieval_skipped = False
         try:
             chunks = await memory_service.retrieve(
                 query=task.query,
@@ -165,37 +187,43 @@ class ResearchAgent:
             )
         except Exception as exc:
             logger.warning(
-                "ResearchAgent retrieval failed — returning degraded result",
+                "ResearchAgent retrieval failed — falling back to general knowledge",
                 extra={
                     "session_id": session_id,
                     "task_id": task.task_id,
                     "error": str(exc),
                 },
             )
-            return ResearchResult(
-                task_id=task.task_id,
-                task_query=task.query,
-                findings="retrieval failed",
-                sources=[],
-                confidence=0.0,
-            )
+            chunks = []
+            retrieval_skipped = True
+
+        if not chunks:
+            retrieval_skipped = True
 
         # ── Step 2: Build context string ──────────────────────────────────────
         if chunks:
+            # RAG mode: synthesise from retrieved document excerpts
             context_str = _build_context(chunks)
             user_prompt = _USER_TEMPLATE.format(
                 query=task.query,
                 context=context_str,
             )
+            active_system = _SYSTEM_PROMPT
         else:
-            user_prompt = _NO_CONTEXT_TEMPLATE.format(query=task.query)
+            # General-knowledge mode: skip RAG, answer directly from LLM knowledge
+            logger.info(
+                "ResearchAgent using general knowledge (no documents retrieved)",
+                extra={"session_id": session_id, "task_id": task.task_id},
+            )
+            user_prompt = _GENERAL_KNOWLEDGE_TEMPLATE.format(query=task.query)
+            active_system = _GENERAL_KNOWLEDGE_SYSTEM_PROMPT
 
         # ── Step 3: Generate findings ─────────────────────────────────────────
         try:
             findings: str = await self._manager.execute(
                 self._provider.generate(
                     prompt=user_prompt,
-                    system=_SYSTEM_PROMPT,
+                    system=active_system,
                 ),
                 caller="research_agent",
             )
@@ -217,7 +245,13 @@ class ResearchAgent:
             )
 
         # ── Step 4: Compute confidence ────────────────────────────────────────
-        confidence = _compute_confidence(chunks)
+        # When RAG was skipped, use the fixed general-knowledge confidence rather
+        # than the retrieval-score mean (which would be 0.0 and misleading).
+        confidence = (
+            _GENERAL_KNOWLEDGE_CONFIDENCE
+            if retrieval_skipped
+            else _compute_confidence(chunks)
+        )
 
         # ── Step 5: Extract sources ───────────────────────────────────────────
         # De-duplicate while preserving order
@@ -235,6 +269,7 @@ class ResearchAgent:
                 "task_id": task.task_id,
                 "confidence": round(confidence, 3),
                 "source_count": len(sources),
+                "rag_used": not retrieval_skipped,
             },
         )
 
