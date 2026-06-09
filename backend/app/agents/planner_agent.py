@@ -70,11 +70,28 @@ to answer it fully. Return ONLY the JSON object.
 
 # ── Complexity thresholds ─────────────────────────────────────────────────────
 # Widened so that "high" is genuinely rare — only deep multi-faceted research.
-# Matches the calibrated prompt above (simple = 1-3 tasks, moderate = 3-5, complex = 6-7).
 
 _COMPLEXITY_LOW    = 3  # 1–3 tasks → low
 _COMPLEXITY_MEDIUM = 5  # 4–5 tasks → medium
 # 6–7 tasks → high
+
+# Hard caps enforced in the parser regardless of LLM output.
+# This ensures that models which ignore prompt calibration instructions
+# cannot push simple queries into "high" by padding with redundant tasks.
+_MAX_TASKS_SIMPLE  = 3  # cap for simple factual queries
+_MAX_TASKS_DEFAULT = 5  # cap for all other queries
+
+# Query prefixes that strongly indicate a simple factual question.
+_SIMPLE_PREFIXES = (
+    "what is ", "what are ", "define ", "who is ", "when did ",
+    "where is ", "how many ", "what does ",
+)
+
+
+def _is_simple_query(query: str) -> bool:
+    """Return True if the query looks like a simple factual question."""
+    q = query.strip().lower()
+    return any(q.startswith(prefix) for prefix in _SIMPLE_PREFIXES)
 
 
 def _estimate_complexity(task_count: int) -> str:
@@ -190,6 +207,26 @@ class PlannerAgent:
                     f"PlannerAgent: Task {i} is malformed. "
                     f"Error: {exc}. Task data: {raw_task}"
                 ) from exc
+
+        # Hard-cap task list based on query type.
+        # This is LLM-proof: even if the model ignores the prompt calibration
+        # and returns 7 tasks for a simple factual question, we trim it here.
+        max_tasks = (
+            _MAX_TASKS_SIMPLE
+            if _is_simple_query(original_query)
+            else _MAX_TASKS_DEFAULT
+        )
+        if len(tasks) > max_tasks:
+            logger.info(
+                "PlannerAgent trimmed task list to cap",
+                extra={
+                    "session_id": session_id,
+                    "original_count": len(tasks),
+                    "cap": max_tasks,
+                    "simple_query": _is_simple_query(original_query),
+                },
+            )
+            tasks = tasks[:max_tasks]
 
         complexity = _estimate_complexity(len(tasks))
 
