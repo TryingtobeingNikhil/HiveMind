@@ -262,17 +262,17 @@ class GroqClient:
         )
 
         try:
-            # Sequential retry loop — only retries on transient network failures.
-            # GroqRateLimitError and GroqAuthenticationError are NOT retried.
+            # Sequential retry loop — retries on transient network failures AND
+            # rate limit errors (HTTP 429). GroqAuthenticationError is NOT retried.
             async for attempt in AsyncRetrying(
                 retry=retry_if_exception_type(
-                    (GroqConnectionError, GroqTimeoutError)
+                    (GroqConnectionError, GroqTimeoutError, GroqRateLimitError)
                 ),
                 stop=stop_after_attempt(self._settings.groq_max_retries + 1),
                 wait=wait_exponential(
                     multiplier=self._settings.groq_retry_wait,
                     min=self._settings.groq_retry_wait,
-                    max=30,
+                    max=60,  # rate limit resets within ~60s on free tier
                 ),
                 reraise=True,
             ):
