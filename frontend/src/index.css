@@ -1,0 +1,184 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── CSS Custom Properties ─────────────────────────────────────────── */
+:root {
+  /* Background layers — darkest → lightest */
+  --bg-base:    #0a0a0a;
+  --bg-surface: #111111;
+  --bg-raised:  #1a1a1a;
+  --bg-hover:   #222222;
+
+  /* Text */
+  --text-primary:   #f0f0f0;
+  --text-secondary: #888888;
+  --text-muted:     #444444;
+
+  /* Accent — indigo, used sparingly */
+  --accent:     #6366f1;
+  --accent-dim: rgba(99, 102, 241, 0.12);
+
+  /* Borders */
+  --border-subtle: #1f1f1f;
+
+  /* Stage colors */
+  --stage-planning:    #f59e0b;
+  --stage-researching: #3b82f6;
+  --stage-critiquing:  #8b5cf6;
+  --stage-reporting:   #10b981;
+  --stage-evaluating:  #f97316;
+  --stage-completed:   #22c55e;
+  --stage-failed:      #ef4444;
+}
+
+/* ── Base Reset ────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  background-color: var(--bg-base);
+  color: var(--text-primary);
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Scrollbars ────────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a2a2a;
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3a3a3a;
+}
+
+/* ── Keyframe Animations ───────────────────────────────────────────── */
+@keyframes pulse-ring {
+  0%   { box-shadow: 0 0 0 0 currentColor; opacity: 0.6; }
+  100% { box-shadow: 0 0 0 8px currentColor; opacity: 0; }
+}
+
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes spin-slow {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+
+/* ── Animation Utility Classes ─────────────────────────────────────── */
+.animate-pulse-ring {
+  animation: pulse-ring 1.5s ease-out infinite;
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up 300ms ease-out forwards;
+}
+
+.animate-fade-in {
+  animation: fade-in 200ms ease-out forwards;
+}
+
+.animate-spin-slow {
+  animation: spin-slow 2s linear infinite;
+}
+
+.animate-blink {
+  animation: blink 1.4s ease-in-out infinite;
+}
+
+/* ── Line Clamp ────────────────────────────────────────────────────── */
+.line-clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* ── Stage line fill transition ────────────────────────────────────── */
+.stage-line {
+  transition: width 600ms ease, background-color 600ms ease;
+}
+
+/* ── Confidence bar fill transition ────────────────────────────────── */
+.confidence-bar-fill {
+  transition: width 800ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ── Panel scrollable areas ────────────────────────────────────────── */
+.panel-scroll {
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
+}
+
+/* ── Textarea auto-grow ────────────────────────────────────────────── */
+.query-textarea {
+  resize: none;
+  overflow-y: auto;
+  min-height: 80px;
+  max-height: 160px;
+}
+
+/* ── Focus ring ────────────────────────────────────────────────────── */
+.focus-ring:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ── Report typography ─────────────────────────────────────────────── */
+.report-body h1 {
+  font-size: 1.375rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 0.75rem;
+  line-height: 1.3;
+}
+
+.report-body h2 {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-top: 1.5rem;
+  margin-bottom: 0.5rem;
+  padding-bottom: 0.25rem;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.report-body p {
+  color: var(--text-secondary);
+  line-height: 1.7;
+  margin-bottom: 0.75rem;
+}
